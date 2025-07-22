@@ -134,12 +134,6 @@ class IERSBulletin(object):
     def archive_path(self, properties):
         return self.product_type
 
-    def _get_url_root(self, physical_name):
-        if physical_name.endswith('.xml'):
-            return "https://datacenter.iers.org/data/xml/"
-        else:
-            return "https://datacenter.iers.org/data/6/"
-
     def analyze(self, paths, filename_only=False):
         inpath = paths[0]
         name_attrs = self.parse_filename(inpath)
