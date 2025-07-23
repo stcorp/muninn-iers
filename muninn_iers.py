@@ -204,8 +204,9 @@ class IERSBulletinB(IERSBulletin):
         idx = lines.index("Final values")
         year, month, day = [int(x) for x in lines[idx + 2].split()[:3]]
         properties.core.validity_start = datetime(year, month, day)
-        # end date is the last entry in the section
-        year, month, day = [int(x) for x in lines[idx + 63].split()[:3]]
+        # end date is the last entry before the next section
+        idx = [lines.index(line) for line in lines if "CELESTIAL POLE OFFSETS" in line][0]
+        year, month, day = [int(x) for x in lines[idx - 1].split()[:3]]
         properties.core.validity_stop = datetime(year, month, day) + timedelta(days=1)
 
     def _analyze_xml(self, root, properties):
