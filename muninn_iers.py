@@ -173,9 +173,16 @@ class IERSBulletinA(IERSBulletin):
         self.url_id = 6
 
     def _analyze_txt(self, lines, properties):
-        properties.core.creation_date = parse_text_date(lines[6][:40].strip())
+        idx = 0
+        while lines[idx].startswith('*'):
+            idx += 1
+        properties.core.creation_date = parse_text_date(lines[idx][:40].strip())
         # start date is the first entry in this section
-        idx = lines.index("CELESTIAL POLE OFFSET SERIES:")
+        try:
+            idx = lines.index("CELESTIAL POLE OFFSET SERIES:")
+        except ValueError:
+            # if celestial pole offset series does not exist then use the first date from this section
+            idx = lines.index("COMBINED EARTH ORIENTATION PARAMETERS:")
         properties.core.validity_start = mjd_to_datetime(int(lines[idx + 4].split()[0]))
         # end date is just before this comment line
         idx = lines.index("These predictions are based on all announced leap seconds.")
