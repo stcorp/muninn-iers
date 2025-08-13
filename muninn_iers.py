@@ -1,10 +1,16 @@
 import os
 import re
+import logging
+import time
 from datetime import datetime, timedelta
 from xml.etree.ElementTree import parse
 
+from muninn import Error, Struct
 from muninn.schema import Mapping, Integer
-from muninn.struct import Struct
+
+
+logger = logging.getLogger(__name__)
+
 
 # Date handling routines
 
@@ -31,6 +37,15 @@ def fromRoman(s: str):
         while s[index:index + len(numeral)] == numeral:
             result += integer
             index += len(numeral)
+    return result
+
+
+def toRoman(n: int):
+    result = ""
+    for numeral, integer in romanNumeralMap:
+        while n >= integer:
+            result += numeral
+            n -= integer
     return result
 
 
@@ -79,7 +94,7 @@ def parse_text_date(text_date, inverted=False):
 
 def mjd_to_datetime(mjd):
     # 2000-01-01 equals MJD 51544
-    return datetime(2000,1,1) + timedelta(days=mjd-51544)
+    return datetime(2000, 1, 1) + timedelta(days=mjd-51544)
 
 
 # Namespaces
@@ -122,6 +137,14 @@ class IERSBulletin(object):
             return match.groupdict()
         return None
 
+    def remote_url(self, physical_name):
+        extension = os.path.splitext(physical_name)[1]
+        if extension == ".xml":
+            return "https://datacenter.iers.org/data/xml/" + physical_name
+        elif extension == ".txt":
+            return f"https://datacenter.iers.org/data/{self.url_id}/" + physical_name
+        raise Exception("invalid extension")
+
     def identify(self, paths):
         if len(paths) != 1:
             return False
@@ -142,11 +165,8 @@ class IERSBulletin(object):
 
         core = properties.core = Struct()
         physical_name = os.path.basename(inpath)
-        core.product_name, extension = os.path.splitext(physical_name)
-        if extension == ".xml":
-            core.remote_url = "https://datacenter.iers.org/data/xml/" + physical_name
-        elif extension == ".txt":
-            core.remote_url = f"https://datacenter.iers.org/data/{self.url_id}/" + physical_name
+        core.product_name = os.path.splitext(physical_name)[0]
+        core.remote_url = self.remote_url(physical_name)
 
         iers = properties.iers = Struct()
         iers.number = int(name_attrs['number'])
@@ -163,8 +183,20 @@ class IERSBulletin(object):
 
         return properties
 
+    def index_for_physical_name(self, physical_name):
+        name_attrs = self.parse_filename(physical_name)
+        return int(name_attrs['number'])
+
+    def next_index(self, index):
+        return index + 1
+
+    def can_skip_index(self, index):
+        return False
+
 
 class IERSBulletinA(IERSBulletin):
+    offset = (18, 1)
+    missing = [(18, 5)]
 
     def __init__(self):
         self.product_type = "IERS_A"
@@ -196,8 +228,28 @@ class IERSBulletinA(IERSBulletin):
         properties.core.validity_stop = parse_xml_time(times[-1])
         properties.core.validity_stop += timedelta(days=1)
 
+    def index_for_physical_name(self, physical_name):
+        name_attrs = self.parse_filename(physical_name)
+        return (fromRoman(name_attrs['volume']), int(name_attrs['number']))
+
+    def physical_name_for_index(self, format, index):
+        return "-".join(["bulletina", toRoman(index[0]).lower(), f"{index[1]:03}"]) + "." + format
+
+    def next_index(self, index):
+        if index[1] == 53:
+            return (index[0] + 1, 1)
+        else:
+            return (index[0], index[1] + 1)
+
+    def can_skip_index(self, index):
+        if index in self.missing:
+            return True
+        if index[1] == 53:
+            return True
+
 
 class IERSBulletinB(IERSBulletin):
+    offset = 253
 
     def __init__(self):
         self.product_type = "IERS_B"
@@ -223,8 +275,12 @@ class IERSBulletinB(IERSBulletin):
         properties.core.validity_stop = parse_xml_time(times[-1])
         properties.core.validity_stop += timedelta(days=1)
 
+    def physical_name_for_index(self, format, index):
+        return "-".join(["bulletinb", f"{index:03}"]) + "." + format
+
 
 class IERSBulletinC(IERSBulletin):
+    offset = 10
 
     def __init__(self):
         self.product_type = "IERS_C"
@@ -243,8 +299,13 @@ class IERSBulletinC(IERSBulletin):
         time = datetime.strptime(root.find(f'{NSIERS}data/{NSIERS}UT/{NSIERS}startDate').text, "%Y-%m-%d")
         properties.core.validity_start = time
 
+    def physical_name_for_index(self, format, index):
+        return "-".join(["bulletinc", f"{index:03}"]) + "." + format
+
 
 class IERSBulletinD(IERSBulletin):
+    offset = 21
+    missing = [25, 26, 27, 29, 34, 35, 38, 42, 45, 47, 48, 49]
 
     def __init__(self):
         self.product_type = "IERS_D"
@@ -273,6 +334,12 @@ class IERSBulletinD(IERSBulletin):
         time = datetime.strptime(root.find(f'{NSIERS}data/{NSIERS}startDate').text, "%Y-%m-%d")
         properties.core.validity_start = time
 
+    def physical_name_for_index(self, format, index):
+        return "-".join(["bulletind", f"{index:03}"]) + "." + format
+
+    def can_skip_index(self, index):
+        return index in self.missing
+
 
 _product_types = {
     "IERS_A": IERSBulletinA(),
@@ -288,3 +355,76 @@ def product_types():
 
 def product_type_plugin(product_type):
     return _product_types.get(product_type)
+
+
+# Synchronizer
+
+class IERSSynchronizer(object):
+
+    def __init__(self, config):
+        '''
+        configuration can contain:
+        - format (string): mandatory; either 'xml' or 'txt'
+        - rate_limit (int): optional; maximum number of requests per minute; default is 120;
+          introduces a delay between each subsequent request; when set to 0, no delay will be used
+        '''
+        if 'format' not in config:
+            raise Error("missing \"format\" setting in configuration for IERS synchronizer")
+        self.format = config['format']
+        self.rate_limit = config.get("rate_limit", 120)
+        if self.format not in ['xml', 'txt']:
+            raise Error(f"invalid IERS synchronizer \"format\" setting; \"{self.format}\" not one of: xml, txt")
+
+    def sync(self, archive, product_types=None, start=None, end=None, force=False):
+        import requests
+
+        if product_types is not None:
+            for product_type in product_types:
+                if product_type not in _product_types:
+                    raise Error(f"product_type \"{product_type}\" is not one of: {', '.join(_product_types.keys())}")
+        else:
+            product_types = _product_types.keys()
+
+        if start is not None:
+            raise Error("\"start\" parameter not supported")
+        if end is not None:
+            raise Error("\"end\" parameter not supported")
+        if force:
+            raise Error("\"force\" parameter not supported")
+
+        for product_type in product_types:
+            plugin = _product_types[product_type]
+
+            # find latest in archive
+            result = archive.search(where="product_type==@product_type", parameters={'product_type': product_type},
+                                    property_names=["physical_name"], order_by=["-iers.volume", "-iers.number"],
+                                    limit=1)
+            if len(result) > 0:
+                index = plugin.next_index(plugin.index_for_physical_name(result[0].core.physical_name))
+            else:
+                index = plugin.offset
+
+            while True:
+                physical_name = plugin.physical_name_for_index(self.format, index)
+                resp = requests.head(plugin.remote_url(physical_name))
+                if resp.status_code == 200:
+                    logger.info(f"adding '{physical_name}'")
+                    properties = plugin.analyze([physical_name], filename_only=True)
+                    properties.core.uuid = archive.generate_uuid()
+                    properties.core.active = True
+                    properties.core.size = int(resp.headers["Content-Length"])
+                    properties.core.product_type = product_type
+                    properties.core.physical_name = physical_name
+                    archive.create_properties(properties)
+                elif resp.status_code == 404:
+                    if not plugin.can_skip_index(index):
+                        break
+                else:
+                    resp.raise_for_status()
+                index = plugin.next_index(index)
+                if self.rate_limit is not None and self.rate_limit > 0:
+                    time.sleep(1 / (self.rate_limit / 60))
+
+
+def synchronizer(config):
+    return IERSSynchronizer(config)
