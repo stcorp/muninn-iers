@@ -246,6 +246,7 @@ class IERSBulletinA(IERSBulletin):
             return True
         if index[1] == 53:
             return True
+        return False
 
 
 class IERSBulletinB(IERSBulletin):
